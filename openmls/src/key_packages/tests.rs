@@ -1,9 +1,66 @@
 use crate::{prelude::ExtensionTypeNotValidInLeafNodeError, test_utils::*};
 use openmls_basic_credential::SignatureKeyPair;
+use openmls_traits::types::{Ciphersuite, SignatureScheme};
 
 use tls_codec::{Deserialize, Serialize};
 
-use crate::{extensions::errors::*, extensions::*, key_packages::*, storage::OpenMlsProvider};
+use crate::{
+    extensions::errors::*,
+    extensions::*,
+    key_packages::{errors::*, *},
+    storage::OpenMlsProvider,
+};
+
+const STAGED_BINDING_EXTENSION_TYPE: u16 = 0xf042;
+const STAGED_TOP_LEVEL_EXTENSION_TYPE: u16 = 0xf043;
+const STAGED_LEAF_EXTENSION_TYPE: u16 = 0xf044;
+
+fn credential_with_key(identity: &[u8], signer: &SignatureKeyPair) -> CredentialWithKey {
+    CredentialWithKey {
+        credential: BasicCredential::new(identity.to_vec()).into(),
+        signature_key: signer.to_public_vec().into(),
+    }
+}
+
+fn staged_capabilities(ciphersuite: Ciphersuite, extensions: &[ExtensionType]) -> Capabilities {
+    Capabilities::new(None, Some(&[ciphersuite]), Some(extensions), None, None)
+}
+
+fn staging_error<T>(result: Result<T, KeyPackageStagingError>) -> KeyPackageStagingError {
+    match result {
+        Ok(_) => panic!("expected staged KeyPackage construction to fail"),
+        Err(error) => error,
+    }
+}
+
+fn duplicate_first_extension<T>(extensions: Extensions<T>) -> Extensions<T>
+where
+    Extensions<T>: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let mut serialized = serde_json::to_value(extensions).expect("serialize extensions");
+    let entries = serialized
+        .get_mut("unique")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("Extensions must serialize its entries as `unique`");
+    entries.push(entries.first().expect("one extension").clone());
+    serde_json::from_value(serialized).expect("deserialize deliberately duplicated extensions")
+}
+
+fn assert_tbs_mutation_changes_canonical_bytes(
+    canonical_bytes: &[u8],
+    tbs: &frankenstein::FrankenKeyPackageTbs,
+    mutate: impl FnOnce(&mut frankenstein::FrankenKeyPackageTbs),
+) {
+    let mut tampered = tbs.clone();
+    mutate(&mut tampered);
+    assert_ne!(
+        canonical_bytes,
+        tampered
+            .tls_serialize_detached()
+            .expect("serialize tampered KeyPackageTBS"),
+        "changing a covered field must change the canonical binding bytes"
+    );
+}
 
 /// Helper function to generate key packages
 pub(crate) fn key_package(
@@ -319,6 +376,989 @@ fn last_resort_key_package() {
         )
         .expect("An unexpected error occurred.");
     assert!(key_package.key_package().last_resort());
+}
+
+/// Preparation exposes the library's exact TLS serialization of the frozen
+/// KeyPackageTBS. Every field below is covered; only the designated binding
+/// extension and the later outer KeyPackage signature are absent.
+#[openmls_test::openmls_test]
+fn staged_prepare_freezes_complete_canonical_tbs() {
+    let provider = &Provider::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let advertised = [
+        ExtensionType::Unknown(STAGED_BINDING_EXTENSION_TYPE),
+        ExtensionType::Unknown(STAGED_TOP_LEVEL_EXTENSION_TYPE),
+        ExtensionType::Unknown(STAGED_LEAF_EXTENSION_TYPE),
+        ExtensionType::LastResort,
+    ];
+    let lifetime = Lifetime::default();
+    let prepared = KeyPackage::builder()
+        .key_package_lifetime(lifetime)
+        .key_package_extensions(
+            Extensions::single(Extension::Unknown(
+                STAGED_TOP_LEVEL_EXTENSION_TYPE,
+                UnknownExtension(vec![0x11, 0x22]),
+            ))
+            .unwrap(),
+        )
+        .leaf_node_capabilities(staged_capabilities(ciphersuite, &advertised))
+        .leaf_node_extensions(
+            Extensions::single(Extension::Unknown(
+                STAGED_LEAF_EXTENSION_TYPE,
+                UnknownExtension(vec![0x33, 0x44]),
+            ))
+            .unwrap(),
+        )
+        .mark_as_last_resort()
+        .prepare(
+            ciphersuite,
+            provider,
+            &signer,
+            credential_with_key(b"frozen staged state", &signer),
+            STAGED_BINDING_EXTENSION_TYPE,
+        )
+        .expect("prepare staged KeyPackage");
+
+    let canonical_bytes = prepared.canonical_binding_bytes().to_vec();
+    assert!(!canonical_bytes.is_empty());
+    assert_eq!(
+        prepared.canonical_binding_bytes(),
+        canonical_bytes.as_slice(),
+        "repeated extraction must be byte-identical"
+    );
+
+    // The returned slice is read-only. Mutating an owned caller copy cannot
+    // mutate the opaque prepared state.
+    let mut caller_copy = canonical_bytes.clone();
+    caller_copy[0] ^= 1;
+    assert_ne!(caller_copy.as_slice(), prepared.canonical_binding_bytes());
+    assert_eq!(prepared.canonical_binding_bytes(), canonical_bytes.as_slice());
+
+    let tbs = frankenstein::FrankenKeyPackageTbs::tls_deserialize_exact(&canonical_bytes)
+        .expect("canonical bytes are exactly one KeyPackageTBS");
+    assert_eq!(tbs.protocol_version, 1);
+    assert_eq!(tbs.ciphersuite, u16::from(ciphersuite));
+    assert_eq!(
+        tbs.leaf_node.capabilities.extensions,
+        advertised.iter().copied().map(u16::from).collect::<Vec<_>>()
+    );
+    assert!(matches!(
+        tbs.leaf_node.leaf_node_source,
+        frankenstein::FrankenLeafNodeSource::KeyPackage(_)
+    ));
+    assert!(!tbs.leaf_node.signature.as_slice().is_empty());
+    assert_eq!(
+        tbs.extensions
+            .iter()
+            .map(frankenstein::FrankenExtension::extension_type)
+            .collect::<Vec<_>>(),
+        vec![
+            frankenstein::FrankenExtensionType::Unknown(STAGED_TOP_LEVEL_EXTENSION_TYPE),
+            frankenstein::FrankenExtensionType::LastResort,
+        ]
+    );
+    assert!(!tbs.extensions.iter().any(|extension| {
+        u16::from(extension.extension_type()) == STAGED_BINDING_EXTENSION_TYPE
+    }));
+
+    assert_tbs_mutation_changes_canonical_bytes(&canonical_bytes, &tbs, |value| {
+        value.protocol_version ^= 1;
+    });
+    assert_tbs_mutation_changes_canonical_bytes(&canonical_bytes, &tbs, |value| {
+        value.ciphersuite ^= 1;
+    });
+    assert_tbs_mutation_changes_canonical_bytes(&canonical_bytes, &tbs, |value| {
+        let mut bytes = value.init_key.as_slice().to_vec();
+        bytes[0] ^= 1;
+        value.init_key = bytes.into();
+    });
+    assert_tbs_mutation_changes_canonical_bytes(&canonical_bytes, &tbs, |value| {
+        let mut bytes = value.leaf_node.encryption_key.as_slice().to_vec();
+        bytes[0] ^= 1;
+        value.leaf_node.encryption_key = bytes.into();
+    });
+    assert_tbs_mutation_changes_canonical_bytes(&canonical_bytes, &tbs, |value| {
+        let mut bytes = value.leaf_node.signature_key.as_slice().to_vec();
+        bytes[0] ^= 1;
+        value.leaf_node.signature_key = bytes.into();
+    });
+    assert_tbs_mutation_changes_canonical_bytes(&canonical_bytes, &tbs, |value| {
+        let credential: Credential = BasicCredential::new(b"different credential".to_vec()).into();
+        value.leaf_node.credential = credential.into();
+    });
+    assert_tbs_mutation_changes_canonical_bytes(&canonical_bytes, &tbs, |value| {
+        value
+            .leaf_node
+            .capabilities
+            .extensions
+            .push(STAGED_BINDING_EXTENSION_TYPE + 10);
+    });
+    assert_tbs_mutation_changes_canonical_bytes(&canonical_bytes, &tbs, |value| {
+        value.leaf_node.capabilities.versions[0] = 0xffff;
+    });
+    assert_tbs_mutation_changes_canonical_bytes(&canonical_bytes, &tbs, |value| {
+        let alternate_ciphersuite =
+            if ciphersuite == Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 {
+                Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256
+            } else {
+                Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519
+            };
+        value.leaf_node.capabilities.ciphersuites[0] = u16::from(alternate_ciphersuite);
+    });
+    assert_tbs_mutation_changes_canonical_bytes(&canonical_bytes, &tbs, |value| {
+        value
+            .leaf_node
+            .capabilities
+            .proposals
+            .push(u16::from(crate::messages::proposals::ProposalType::Add));
+    });
+    assert_tbs_mutation_changes_canonical_bytes(&canonical_bytes, &tbs, |value| {
+        value.leaf_node.capabilities.credentials[0] =
+            u16::from(crate::credentials::CredentialType::X509);
+    });
+    assert_tbs_mutation_changes_canonical_bytes(&canonical_bytes, &tbs, |value| {
+        let frankenstein::FrankenLeafNodeSource::KeyPackage(lifetime) =
+            &mut value.leaf_node.leaf_node_source
+        else {
+            panic!("prepared leaf must have a KeyPackage lifetime");
+        };
+        lifetime.not_before += 1;
+    });
+    assert_tbs_mutation_changes_canonical_bytes(&canonical_bytes, &tbs, |value| {
+        let frankenstein::FrankenLeafNodeSource::KeyPackage(lifetime) =
+            &mut value.leaf_node.leaf_node_source
+        else {
+            panic!("prepared leaf must have a KeyPackage lifetime");
+        };
+        lifetime.not_after += 1;
+    });
+    assert_tbs_mutation_changes_canonical_bytes(&canonical_bytes, &tbs, |value| {
+        value
+            .leaf_node
+            .extensions
+            .push(frankenstein::FrankenExtension::Unknown(
+                STAGED_LEAF_EXTENSION_TYPE + 10,
+                vec![0x55].into(),
+            ));
+    });
+    assert_tbs_mutation_changes_canonical_bytes(&canonical_bytes, &tbs, |value| {
+        let mut bytes = value.leaf_node.signature.as_slice().to_vec();
+        bytes[0] ^= 1;
+        value.leaf_node.signature = bytes.into();
+    });
+    assert_tbs_mutation_changes_canonical_bytes(&canonical_bytes, &tbs, |value| {
+        value
+            .extensions
+            .push(frankenstein::FrankenExtension::Unknown(
+                STAGED_TOP_LEVEL_EXTENSION_TYPE + 10,
+                vec![0x66].into(),
+            ));
+    });
+}
+
+/// Binding inserts exactly one designated top-level extension. The final
+/// package validates both MLS signatures, and a parsed/validated verifier
+/// recomputes the preparation bytes byte-for-byte.
+#[openmls_test::openmls_test]
+fn staged_binding_insertion_signatures_and_verifier_recomputation() {
+    let provider = &Provider::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let advertised = [
+        ExtensionType::Unknown(STAGED_BINDING_EXTENSION_TYPE),
+        ExtensionType::Unknown(STAGED_TOP_LEVEL_EXTENSION_TYPE),
+        ExtensionType::Unknown(STAGED_LEAF_EXTENSION_TYPE),
+        ExtensionType::LastResort,
+    ];
+    let prepared = KeyPackage::builder()
+        .key_package_extensions(
+            Extensions::single(Extension::Unknown(
+                STAGED_TOP_LEVEL_EXTENSION_TYPE,
+                UnknownExtension(vec![0xa1]),
+            ))
+            .unwrap(),
+        )
+        .leaf_node_capabilities(staged_capabilities(ciphersuite, &advertised))
+        .leaf_node_extensions(
+            Extensions::single(Extension::Unknown(
+                STAGED_LEAF_EXTENSION_TYPE,
+                UnknownExtension(vec![0xb2]),
+            ))
+            .unwrap(),
+        )
+        .mark_as_last_resort()
+        .prepare(
+            ciphersuite,
+            provider,
+            &signer,
+            credential_with_key(b"bound staged state", &signer),
+            STAGED_BINDING_EXTENSION_TYPE,
+        )
+        .expect("prepare staged KeyPackage");
+    let canonical_bytes = prepared.canonical_binding_bytes().to_vec();
+    let binding = vec![0xde, 0xad, 0xbe, 0xef];
+    let bundle = prepared
+        .with_external_binding(binding.clone())
+        .expect("insert external binding")
+        .finalize(provider, &signer)
+        .expect("finalize staged KeyPackage");
+    let key_package = bundle.key_package();
+
+    let extensions = key_package.extensions().iter().cloned().collect::<Vec<_>>();
+    assert_eq!(
+        extensions,
+        vec![
+            Extension::Unknown(
+                STAGED_TOP_LEVEL_EXTENSION_TYPE,
+                UnknownExtension(vec![0xa1])
+            ),
+            Extension::LastResort(LastResortExtension::default()),
+            Extension::Unknown(
+                STAGED_BINDING_EXTENSION_TYPE,
+                UnknownExtension(binding.clone())
+            ),
+        ],
+        "binding insertion must retain order and append only the designated extension"
+    );
+    assert_eq!(
+        key_package
+            .leaf_node()
+            .extensions()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![Extension::Unknown(
+            STAGED_LEAF_EXTENSION_TYPE,
+            UnknownExtension(vec![0xb2])
+        )]
+    );
+
+    let mut stripped_tbs = key_package.payload.clone();
+    assert_eq!(
+        stripped_tbs
+            .extensions
+            .remove(ExtensionType::Unknown(STAGED_BINDING_EXTENSION_TYPE)),
+        Some(Extension::Unknown(
+            STAGED_BINDING_EXTENSION_TYPE,
+            UnknownExtension(binding)
+        ))
+    );
+    assert_eq!(
+        stripped_tbs.tls_serialize_detached().unwrap(),
+        canonical_bytes,
+        "the final TBS must differ from preparation by exactly the binding extension"
+    );
+
+    let wire = key_package.tls_serialize_detached().unwrap();
+    let validated = KeyPackageIn::tls_deserialize_exact(&wire)
+        .expect("parse final KeyPackage")
+        .validate(provider.crypto(), ProtocolVersion::Mls10)
+        .expect("both leaf and outer KeyPackage signatures verify");
+    assert_eq!(
+        validated
+            .canonical_binding_bytes(STAGED_BINDING_EXTENSION_TYPE)
+            .expect("recompute canonical binding bytes from validated parsed object"),
+        canonical_bytes
+    );
+
+    let franken = frankenstein::FrankenKeyPackage::from(key_package.clone());
+    let mut invalid_leaf_signature = franken.clone();
+    let mut signature = invalid_leaf_signature
+        .leaf_node
+        .signature
+        .as_slice()
+        .to_vec();
+    signature[0] ^= 1;
+    invalid_leaf_signature.leaf_node.signature = signature.into();
+    assert_eq!(
+        KeyPackageIn::from(invalid_leaf_signature)
+            .validate(provider.crypto(), ProtocolVersion::Mls10)
+            .unwrap_err(),
+        KeyPackageVerifyError::InvalidLeafNodeSignature
+    );
+
+    let mut invalid_outer_signature = franken;
+    let mut signature = invalid_outer_signature.signature.as_slice().to_vec();
+    signature[0] ^= 1;
+    invalid_outer_signature.signature = signature.into();
+    assert_eq!(
+        KeyPackageIn::from(invalid_outer_signature)
+            .validate(provider.crypto(), ProtocolVersion::Mls10)
+            .unwrap_err(),
+        KeyPackageVerifyError::InvalidSignature
+    );
+}
+
+/// Preparation and binding insertion do not write storage. Consuming
+/// finalization writes the completed bundle exactly once under its final hash.
+#[test]
+fn staged_finalization_is_single_use_and_stores_once() {
+    let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+    let provider = OpenMlsRustCrypto::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let capabilities = staged_capabilities(
+        ciphersuite,
+        &[ExtensionType::Unknown(STAGED_BINDING_EXTENSION_TYPE)],
+    );
+    let initial_entries = provider.storage().values.read().unwrap().len();
+
+    let prepared = KeyPackage::builder()
+        .leaf_node_capabilities(capabilities)
+        .prepare(
+            ciphersuite,
+            &provider,
+            &signer,
+            credential_with_key(b"single use", &signer),
+            STAGED_BINDING_EXTENSION_TYPE,
+        )
+        .expect("prepare staged KeyPackage");
+    assert_eq!(provider.storage().values.read().unwrap().len(), initial_entries);
+
+    let bound = prepared
+        .with_external_binding(vec![0x01])
+        .expect("bind staged KeyPackage");
+    assert_eq!(provider.storage().values.read().unwrap().len(), initial_entries);
+
+    // `BoundKeyPackage::finalize` consumes `bound`; a second finalization of
+    // this state is unrepresentable. The public integration test additionally
+    // pins the by-value receiver through UFCS.
+    let bundle = BoundKeyPackage::finalize(bound, &provider, &signer)
+        .expect("single consuming finalization succeeds");
+    assert_eq!(
+        provider.storage().values.read().unwrap().len(),
+        initial_entries + 1
+    );
+    let reference = bundle.key_package().hash_ref(provider.crypto()).unwrap();
+    let stored: Option<KeyPackageBundle> = provider.storage().key_package(&reference).unwrap();
+    assert_eq!(
+        stored.expect("final bundle stored").key_package(),
+        bundle.key_package()
+    );
+}
+
+#[openmls_test::openmls_test]
+fn staged_signer_credential_and_ciphersuite_mismatches_are_rejected() {
+    let provider = &Provider::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let other_signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let capabilities = staged_capabilities(
+        ciphersuite,
+        &[ExtensionType::Unknown(STAGED_BINDING_EXTENSION_TYPE)],
+    );
+
+    let error = staging_error(
+        KeyPackage::builder()
+            .leaf_node_capabilities(capabilities.clone())
+            .prepare(
+                ciphersuite,
+                provider,
+                &signer,
+                credential_with_key(b"wrong credential key", &other_signer),
+                STAGED_BINDING_EXTENSION_TYPE,
+            ),
+    );
+    assert!(matches!(error, KeyPackageStagingError::SignerMismatch));
+
+    let mismatched_scheme = if ciphersuite.signature_algorithm() == SignatureScheme::ED25519 {
+        SignatureScheme::ECDSA_SECP256R1_SHA256
+    } else {
+        SignatureScheme::ED25519
+    };
+    let mismatched_signer = SignatureKeyPair::new(mismatched_scheme).unwrap();
+    let error = staging_error(
+        KeyPackage::builder()
+            .leaf_node_capabilities(capabilities.clone())
+            .prepare(
+                ciphersuite,
+                provider,
+                &mismatched_signer,
+                credential_with_key(b"wrong ciphersuite signer", &mismatched_signer),
+                STAGED_BINDING_EXTENSION_TYPE,
+            ),
+    );
+    assert!(matches!(
+        error,
+        KeyPackageStagingError::KeyPackageNewError(
+            KeyPackageNewError::CiphersuiteSignatureSchemeMismatch
+        )
+    ));
+
+    let prepared = KeyPackage::builder()
+        .leaf_node_capabilities(capabilities.clone())
+        .prepare(
+            ciphersuite,
+            provider,
+            &signer,
+            credential_with_key(b"final signer mismatch", &signer),
+            STAGED_BINDING_EXTENSION_TYPE,
+        )
+        .unwrap();
+    let error = staging_error(
+        prepared
+            .with_external_binding(vec![0x02])
+            .unwrap()
+            .finalize(provider, &other_signer),
+    );
+    assert!(matches!(error, KeyPackageStagingError::SignerMismatch));
+
+    let prepared = KeyPackage::builder()
+        .leaf_node_capabilities(capabilities)
+        .prepare(
+            ciphersuite,
+            provider,
+            &signer,
+            credential_with_key(b"final ciphersuite mismatch", &signer),
+            STAGED_BINDING_EXTENSION_TYPE,
+        )
+        .unwrap();
+    let error = staging_error(
+        prepared
+            .with_external_binding(vec![0x03])
+            .unwrap()
+            .finalize(provider, &mismatched_signer),
+    );
+    assert!(matches!(
+        error,
+        KeyPackageStagingError::KeyPackageNewError(
+            KeyPackageNewError::CiphersuiteSignatureSchemeMismatch
+        )
+    ));
+}
+
+#[openmls_test::openmls_test]
+fn staged_binding_and_extension_malformations_are_rejected() {
+    let provider = &Provider::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let credential = || credential_with_key(b"staged validation", &signer);
+
+    for invalid_type in [1, 10, 0x0a0a] {
+        let error = staging_error(KeyPackage::builder().prepare(
+            ciphersuite,
+            provider,
+            &signer,
+            credential(),
+            invalid_type,
+        ));
+        assert!(matches!(
+            error,
+            KeyPackageStagingError::InvalidBindingExtensionType(value)
+                if value == invalid_type
+        ));
+    }
+
+    #[cfg(feature = "extensions-draft")]
+    {
+        let error = staging_error(KeyPackage::builder().prepare(
+            ciphersuite,
+            provider,
+            &signer,
+            credential(),
+            6,
+        ));
+        assert!(matches!(
+            error,
+            KeyPackageStagingError::InvalidBindingExtensionType(6)
+        ));
+    }
+
+    #[cfg(not(feature = "extensions-draft"))]
+    {
+        KeyPackage::builder()
+            .leaf_node_capabilities(staged_capabilities(
+                ciphersuite,
+                &[ExtensionType::Unknown(6)],
+            ))
+            .prepare(ciphersuite, provider, &signer, credential(), 6)
+            .expect("code point 6 is unknown without extensions-draft");
+    }
+
+    let advertised_binding = staged_capabilities(
+        ciphersuite,
+        &[ExtensionType::Unknown(STAGED_BINDING_EXTENSION_TYPE)],
+    );
+    let error = staging_error(
+        KeyPackage::builder()
+            .leaf_node_capabilities(advertised_binding.clone())
+            .key_package_extensions(
+                Extensions::single(Extension::Unknown(
+                    STAGED_BINDING_EXTENSION_TYPE,
+                    UnknownExtension(vec![0x01]),
+                ))
+                .unwrap(),
+            )
+            .prepare(
+                ciphersuite,
+                provider,
+                &signer,
+                credential(),
+                STAGED_BINDING_EXTENSION_TYPE,
+            ),
+    );
+    assert!(matches!(
+        error,
+        KeyPackageStagingError::DuplicateBindingExtension(STAGED_BINDING_EXTENSION_TYPE)
+    ));
+
+    let error = staging_error(KeyPackage::builder().prepare(
+        ciphersuite,
+        provider,
+        &signer,
+        credential(),
+        STAGED_BINDING_EXTENSION_TYPE,
+    ));
+    assert!(matches!(
+        error,
+        KeyPackageStagingError::BindingExtensionNotAdvertised(STAGED_BINDING_EXTENSION_TYPE)
+    ));
+
+    let prepared = KeyPackage::builder()
+        .leaf_node_capabilities(advertised_binding.clone())
+        .prepare(
+            ciphersuite,
+            provider,
+            &signer,
+            credential(),
+            STAGED_BINDING_EXTENSION_TYPE,
+        )
+        .unwrap();
+    assert!(matches!(
+        staging_error(prepared.with_external_binding(Vec::new())),
+        KeyPackageStagingError::EmptyBinding
+    ));
+
+    let unbound_bundle = KeyPackage::builder()
+        .build(ciphersuite, provider, &signer, credential())
+        .unwrap();
+    let unbound_wire = unbound_bundle
+        .key_package()
+        .tls_serialize_detached()
+        .unwrap();
+    let unbound = KeyPackageIn::tls_deserialize_exact(&unbound_wire)
+        .unwrap()
+        .validate(provider.crypto(), ProtocolVersion::Mls10)
+        .unwrap();
+    assert!(matches!(
+        unbound.canonical_binding_bytes(STAGED_BINDING_EXTENSION_TYPE),
+        Err(KeyPackageStagingError::MissingBindingExtension(
+            STAGED_BINDING_EXTENSION_TYPE
+        ))
+    ));
+    assert!(matches!(
+        unbound.canonical_binding_bytes(10),
+        Err(KeyPackageStagingError::InvalidBindingExtensionType(10))
+    ));
+
+    let empty_binding_bundle = KeyPackage::builder()
+        .leaf_node_capabilities(advertised_binding.clone())
+        .key_package_extensions(
+            Extensions::single(Extension::Unknown(
+                STAGED_BINDING_EXTENSION_TYPE,
+                UnknownExtension(Vec::new()),
+            ))
+            .unwrap(),
+        )
+        .build(ciphersuite, provider, &signer, credential())
+        .unwrap();
+    let empty_binding_wire = empty_binding_bundle
+        .key_package()
+        .tls_serialize_detached()
+        .unwrap();
+    let empty_binding = KeyPackageIn::tls_deserialize_exact(&empty_binding_wire)
+        .unwrap()
+        .validate(provider.crypto(), ProtocolVersion::Mls10)
+        .unwrap();
+    assert!(matches!(
+        empty_binding.canonical_binding_bytes(STAGED_BINDING_EXTENSION_TYPE),
+        Err(KeyPackageStagingError::EmptyBinding)
+    ));
+
+    let noncanonical_top = Extensions::single(Extension::Unknown(
+        u16::from(ExtensionType::LastResort),
+        UnknownExtension(vec![0x99]),
+    ))
+    .unwrap();
+    let error = staging_error(
+        KeyPackage::builder()
+            .leaf_node_capabilities(advertised_binding.clone())
+            .key_package_extensions(noncanonical_top)
+            .prepare(
+                ciphersuite,
+                provider,
+                &signer,
+                credential(),
+                STAGED_BINDING_EXTENSION_TYPE,
+            ),
+    );
+    assert!(matches!(
+        error,
+        KeyPackageStagingError::NonCanonicalExtensionType {
+            location: StagedExtensionLocation::KeyPackage,
+            extension_type: 10,
+        }
+    ));
+
+    let duplicated_top = duplicate_first_extension(
+        Extensions::single(Extension::Unknown(
+            STAGED_TOP_LEVEL_EXTENSION_TYPE,
+            UnknownExtension(vec![0x77]),
+        ))
+        .unwrap(),
+    );
+    let error = staging_error(
+        KeyPackage::builder()
+            .leaf_node_capabilities(staged_capabilities(
+                ciphersuite,
+                &[
+                    ExtensionType::Unknown(STAGED_BINDING_EXTENSION_TYPE),
+                    ExtensionType::Unknown(STAGED_TOP_LEVEL_EXTENSION_TYPE),
+                ],
+            ))
+            .key_package_extensions(duplicated_top)
+            .prepare(
+                ciphersuite,
+                provider,
+                &signer,
+                credential(),
+                STAGED_BINDING_EXTENSION_TYPE,
+            ),
+    );
+    assert!(matches!(
+        error,
+        KeyPackageStagingError::DuplicateExtensionType {
+            location: StagedExtensionLocation::KeyPackage,
+            extension_type: STAGED_TOP_LEVEL_EXTENSION_TYPE,
+        }
+    ));
+
+    let invalid_top_value = serde_json::to_value(
+        Extensions::<LeafNode>::single(Extension::ApplicationId(ApplicationIdExtension::new(
+            b"not valid at top level",
+        )))
+        .unwrap(),
+    )
+    .unwrap();
+    let invalid_top: Extensions<KeyPackage> = serde_json::from_value(invalid_top_value).unwrap();
+    let error = staging_error(
+        KeyPackage::builder()
+            .leaf_node_capabilities(advertised_binding.clone())
+            .key_package_extensions(invalid_top)
+            .prepare(
+                ciphersuite,
+                provider,
+                &signer,
+                credential(),
+                STAGED_BINDING_EXTENSION_TYPE,
+            ),
+    );
+    assert!(matches!(
+        error,
+        KeyPackageStagingError::InvalidExtensionForLocation {
+            location: StagedExtensionLocation::KeyPackage,
+            extension_type: 1,
+        }
+    ));
+
+    let noncanonical_leaf_value = serde_json::to_value(
+        Extensions::<KeyPackage>::single(Extension::Unknown(
+            u16::from(ExtensionType::ApplicationId),
+            UnknownExtension(vec![0xaa]),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let noncanonical_leaf: Extensions<LeafNode> =
+        serde_json::from_value(noncanonical_leaf_value).unwrap();
+    let error = staging_error(
+        KeyPackage::builder()
+            .leaf_node_capabilities(advertised_binding.clone())
+            .leaf_node_extensions(noncanonical_leaf)
+            .prepare(
+                ciphersuite,
+                provider,
+                &signer,
+                credential(),
+                STAGED_BINDING_EXTENSION_TYPE,
+            ),
+    );
+    assert!(matches!(
+        error,
+        KeyPackageStagingError::NonCanonicalExtensionType {
+            location: StagedExtensionLocation::LeafNode,
+            extension_type: 1,
+        }
+    ));
+
+    let duplicated_leaf = duplicate_first_extension(
+        Extensions::<LeafNode>::single(Extension::Unknown(
+            STAGED_LEAF_EXTENSION_TYPE,
+            UnknownExtension(vec![0xbb]),
+        ))
+        .unwrap(),
+    );
+    let error = staging_error(
+        KeyPackage::builder()
+            .leaf_node_capabilities(staged_capabilities(
+                ciphersuite,
+                &[
+                    ExtensionType::Unknown(STAGED_BINDING_EXTENSION_TYPE),
+                    ExtensionType::Unknown(STAGED_LEAF_EXTENSION_TYPE),
+                ],
+            ))
+            .leaf_node_extensions(duplicated_leaf)
+            .prepare(
+                ciphersuite,
+                provider,
+                &signer,
+                credential(),
+                STAGED_BINDING_EXTENSION_TYPE,
+            ),
+    );
+    assert!(matches!(
+        error,
+        KeyPackageStagingError::DuplicateExtensionType {
+            location: StagedExtensionLocation::LeafNode,
+            extension_type: STAGED_LEAF_EXTENSION_TYPE,
+        }
+    ));
+
+    let invalid_leaf_value = serde_json::to_value(
+        Extensions::<KeyPackage>::single(Extension::LastResort(
+            LastResortExtension::default(),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let invalid_leaf: Extensions<LeafNode> = serde_json::from_value(invalid_leaf_value).unwrap();
+    let error = staging_error(
+        KeyPackage::builder()
+            .leaf_node_capabilities(advertised_binding.clone())
+            .leaf_node_extensions(invalid_leaf)
+            .prepare(
+                ciphersuite,
+                provider,
+                &signer,
+                credential(),
+                STAGED_BINDING_EXTENSION_TYPE,
+            ),
+    );
+    assert!(matches!(
+        error,
+        KeyPackageStagingError::InvalidExtensionForLocation {
+            location: StagedExtensionLocation::LeafNode,
+            extension_type: 10,
+        }
+    ));
+
+    let prepared = KeyPackage::builder()
+        .leaf_node_capabilities(advertised_binding)
+        .prepare(
+            ciphersuite,
+            provider,
+            &signer,
+            credential(),
+            STAGED_BINDING_EXTENSION_TYPE,
+        )
+        .unwrap();
+    let bundle = prepared
+        .with_external_binding(vec![0x88])
+        .unwrap()
+        .finalize(provider, &signer)
+        .unwrap();
+    let mut duplicate_wire = frankenstein::FrankenKeyPackage::from(bundle);
+    let binding = duplicate_wire
+        .extensions
+        .iter()
+        .find(|extension| {
+            u16::from(extension.extension_type()) == STAGED_BINDING_EXTENSION_TYPE
+        })
+        .unwrap()
+        .clone();
+    duplicate_wire.extensions.push(binding);
+    assert!(
+        KeyPackageIn::tls_deserialize_exact(&duplicate_wire.tls_serialize_detached().unwrap())
+            .is_err(),
+        "normal TLS decoding must reject duplicate numeric binding extensions"
+    );
+}
+
+#[openmls_test::openmls_test]
+fn staged_retained_extensions_require_explicit_advertisement() {
+    let provider = &Provider::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let credential = || credential_with_key(b"extension advertisement", &signer);
+    let binding_only = staged_capabilities(
+        ciphersuite,
+        &[ExtensionType::Unknown(STAGED_BINDING_EXTENSION_TYPE)],
+    );
+
+    let error = staging_error(
+        KeyPackage::builder()
+            .leaf_node_capabilities(binding_only.clone())
+            .key_package_extensions(
+                Extensions::single(Extension::Unknown(
+                    STAGED_TOP_LEVEL_EXTENSION_TYPE,
+                    UnknownExtension(vec![0x01]),
+                ))
+                .unwrap(),
+            )
+            .prepare(
+                ciphersuite,
+                provider,
+                &signer,
+                credential(),
+                STAGED_BINDING_EXTENSION_TYPE,
+            ),
+    );
+    assert!(matches!(
+        error,
+        KeyPackageStagingError::ExtensionNotAdvertised {
+            location: StagedExtensionLocation::KeyPackage,
+            extension_type: STAGED_TOP_LEVEL_EXTENSION_TYPE,
+        }
+    ));
+
+    let error = staging_error(
+        KeyPackage::builder()
+            .leaf_node_capabilities(binding_only.clone())
+            .leaf_node_extensions(
+                Extensions::single(Extension::Unknown(
+                    STAGED_LEAF_EXTENSION_TYPE,
+                    UnknownExtension(vec![0x02]),
+                ))
+                .unwrap(),
+            )
+            .prepare(
+                ciphersuite,
+                provider,
+                &signer,
+                credential(),
+                STAGED_BINDING_EXTENSION_TYPE,
+            ),
+    );
+    assert!(matches!(
+        error,
+        KeyPackageStagingError::ExtensionNotAdvertised {
+            location: StagedExtensionLocation::LeafNode,
+            extension_type: STAGED_LEAF_EXTENSION_TYPE,
+        }
+    ));
+
+    let error = staging_error(
+        KeyPackage::builder()
+            .leaf_node_capabilities(binding_only)
+            .mark_as_last_resort()
+            .prepare(
+                ciphersuite,
+                provider,
+                &signer,
+                credential(),
+                STAGED_BINDING_EXTENSION_TYPE,
+            ),
+    );
+    assert!(matches!(
+        error,
+        KeyPackageStagingError::ExtensionNotAdvertised {
+            location: StagedExtensionLocation::KeyPackage,
+            extension_type: 10,
+        }
+    ));
+
+    let all_advertised = [
+        ExtensionType::Unknown(STAGED_BINDING_EXTENSION_TYPE),
+        ExtensionType::Unknown(STAGED_TOP_LEVEL_EXTENSION_TYPE),
+        ExtensionType::Unknown(STAGED_LEAF_EXTENSION_TYPE),
+        ExtensionType::LastResort,
+    ];
+    let bundle = KeyPackage::builder()
+        .leaf_node_capabilities(staged_capabilities(ciphersuite, &all_advertised))
+        .key_package_extensions(
+            Extensions::single(Extension::Unknown(
+                STAGED_TOP_LEVEL_EXTENSION_TYPE,
+                UnknownExtension(vec![0x03]),
+            ))
+            .unwrap(),
+        )
+        .leaf_node_extensions(
+            Extensions::single(Extension::Unknown(
+                STAGED_LEAF_EXTENSION_TYPE,
+                UnknownExtension(vec![0x04]),
+            ))
+            .unwrap(),
+        )
+        .mark_as_last_resort()
+        .prepare(
+            ciphersuite,
+            provider,
+            &signer,
+            credential(),
+            STAGED_BINDING_EXTENSION_TYPE,
+        )
+        .unwrap()
+        .with_external_binding(vec![0x05])
+        .unwrap()
+        .finalize(provider, &signer)
+        .unwrap();
+    assert!(bundle.key_package().last_resort());
+    assert!(bundle
+        .key_package()
+        .extensions()
+        .contains(ExtensionType::Unknown(STAGED_TOP_LEVEL_EXTENSION_TYPE)));
+    assert!(bundle
+        .key_package()
+        .leaf_node()
+        .extensions()
+        .contains(ExtensionType::Unknown(STAGED_LEAF_EXTENSION_TYPE)));
+}
+
+/// The existing one-shot builder deliberately keeps its stock acceptance
+/// boundary. Staged-only advertisement checks must not leak into `build()`.
+#[openmls_test::openmls_test]
+fn staged_api_preserves_ordinary_build_with_unadvertised_extensions_and_last_resort() {
+    let provider = &Provider::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let bundle = KeyPackage::builder()
+        .key_package_extensions(
+            Extensions::single(Extension::Unknown(
+                STAGED_TOP_LEVEL_EXTENSION_TYPE,
+                UnknownExtension(vec![0x10]),
+            ))
+            .unwrap(),
+        )
+        .leaf_node_extensions(
+            Extensions::single(Extension::Unknown(
+                STAGED_LEAF_EXTENSION_TYPE,
+                UnknownExtension(vec![0x20]),
+            ))
+            .unwrap(),
+        )
+        .mark_as_last_resort()
+        .build(
+            ciphersuite,
+            provider,
+            &signer,
+            credential_with_key(b"ordinary builder", &signer),
+        )
+        .expect("ordinary build must retain its stock accepted-input behavior");
+
+    assert!(bundle.key_package().last_resort());
+    assert!(bundle
+        .key_package()
+        .extensions()
+        .contains(ExtensionType::Unknown(STAGED_TOP_LEVEL_EXTENSION_TYPE)));
+    assert!(bundle
+        .key_package()
+        .leaf_node()
+        .extensions()
+        .contains(ExtensionType::Unknown(STAGED_LEAF_EXTENSION_TYPE)));
+
+    let wire = bundle.key_package().tls_serialize_detached().unwrap();
+    assert_eq!(
+        KeyPackageIn::tls_deserialize_exact(&wire)
+            .unwrap()
+            .validate(provider.crypto(), ProtocolVersion::Mls10)
+            .unwrap_err(),
+        KeyPackageVerifyError::UnsupportedExtension,
+        "normal receive validation, not ordinary build, owns this stock check"
+    );
 }
 
 /// Build a batch of virtual-client KeyPackages and verify the first carries a
