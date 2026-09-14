@@ -1,0 +1,28 @@
+name: staged-keypackage-verification
+
+on:
+  push:
+    branches:
+      - agent-trust/keypackage-staging-v0.9
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Focused staged unit tests
+        run: cargo test -p openmls --lib --no-default-features key_packages::tests::staged_
+      - name: Public staged API test
+        run: cargo test -p openmls --test stock_staged_key_package_api --no-default-features
+      - name: OpenMLS regression tests
+        run: cargo test -p openmls --lib
