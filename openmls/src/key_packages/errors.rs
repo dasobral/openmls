@@ -80,3 +80,73 @@ pub enum KeyPackageNewError {
     #[error("A virtual-clients KeyPackage batch must request at least one KeyPackage.")]
     EmptyBatch,
 }
+
+/// Location of an extension list checked during staged KeyPackage preparation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedExtensionLocation {
+    /// The top-level KeyPackage extension list.
+    KeyPackage,
+    /// The LeafNode extension list.
+    LeafNode,
+}
+
+/// Errors returned by the staged KeyPackage construction API.
+#[derive(Error, Debug, PartialEq, Clone)]
+pub enum KeyPackageStagingError {
+    /// An error from the ordinary KeyPackage creation path.
+    #[error(transparent)]
+    KeyPackageNewError(#[from] KeyPackageNewError),
+    /// The selected code point is recognized or GREASE in this build.
+    #[error("invalid binding extension type {0}")]
+    InvalidBindingExtensionType(u16),
+    /// The builder already contains the designated binding code point.
+    #[error("binding extension type {0} is already present")]
+    DuplicateBindingExtension(u16),
+    /// The designated binding type is absent from leaf capabilities.
+    #[error("binding extension type {0} is not advertised")]
+    BindingExtensionNotAdvertised(u16),
+    /// A retained extension has a non-canonical enum/numeric representation.
+    #[error("non-canonical {location:?} extension type {extension_type}")]
+    NonCanonicalExtensionType {
+        /// The extension-list location.
+        location: StagedExtensionLocation,
+        /// The encoded extension type.
+        extension_type: u16,
+    },
+    /// Two retained extensions encode the same numeric type.
+    #[error("duplicate {location:?} extension type {extension_type}")]
+    DuplicateExtensionType {
+        /// The extension-list location.
+        location: StagedExtensionLocation,
+        /// The encoded extension type.
+        extension_type: u16,
+    },
+    /// A retained extension is not valid in its list.
+    #[error("invalid extension type {extension_type} for {location:?}")]
+    InvalidExtensionForLocation {
+        /// The extension-list location.
+        location: StagedExtensionLocation,
+        /// The encoded extension type.
+        extension_type: u16,
+    },
+    /// A retained extension is not advertised in leaf capabilities.
+    #[error("{location:?} extension type {extension_type} is not advertised")]
+    ExtensionNotAdvertised {
+        /// The extension-list location.
+        location: StagedExtensionLocation,
+        /// The encoded extension type.
+        extension_type: u16,
+    },
+    /// The supplied external binding is empty.
+    #[error("the external binding is empty")]
+    EmptyBinding,
+    /// The designated binding is absent from a final KeyPackage.
+    #[error("binding extension type {0} is missing")]
+    MissingBindingExtension(u16),
+    /// A signature did not verify under the frozen credential key.
+    #[error("the signer does not match the credential signature key")]
+    SignerMismatch,
+    /// Canonical TLS serialization failed.
+    #[error("canonical TLS serialization failed")]
+    TlsSerializationError,
+}
