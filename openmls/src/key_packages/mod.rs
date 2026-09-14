@@ -315,6 +315,14 @@ impl BoundKeyPackage {
                 KeyPackageNewError::CiphersuiteSignatureSchemeMismatch,
             ));
         }
+        provider
+            .crypto()
+            .supports(ciphersuite)
+            .map_err(|_| {
+                KeyPackageStagingError::KeyPackageNewError(
+                    KeyPackageNewError::UnsupportedCiphersuite(ciphersuite),
+                )
+            })?;
 
         let key_package = self
             .key_package_tbs
