@@ -98,9 +98,7 @@ use crate::{
     },
     credentials::*,
     error::LibraryError,
-    extensions::{
-        Extension, ExtensionType, Extensions, LastResortExtension, UnknownExtension,
-    },
+    extensions::{Extension, ExtensionType, Extensions, LastResortExtension, UnknownExtension},
     storage::OpenMlsProvider,
     treesync::{
         node::{
@@ -240,7 +238,6 @@ pub(crate) struct KeyPackageCreationResult {
     pub encryption_keypair: EncryptionKeyPair,
     pub init_private_key: HpkePrivateKey,
 }
-
 
 /// A prepared KeyPackage whose public TBS material and leaf signature are frozen.
 ///
@@ -741,7 +738,6 @@ impl KeyPackage {
     }
 }
 
-
 impl KeyPackage {
     /// Return the canonical TLS serialization of this KeyPackageTBS with the
     /// designated external binding extension removed.
@@ -878,8 +874,7 @@ impl KeyPackageBuilder {
         }
     }
 
-
-    /// Prepare and freeze a KeyPackage before an external binding is computed.
+    //// Prepare and freeze a KeyPackage before an external binding is computed.
     pub fn prepare(
         mut self,
         ciphersuite: Ciphersuite,
