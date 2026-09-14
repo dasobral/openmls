@@ -1,0 +1,49 @@
+OpenMLS staged KeyPackage Task 2 RED evidence
+Timestamp (UTC): 2026-09-14T09:40:47Z
+
+Focused unit-test command:
+  cargo test -p openmls --lib --no-default-features key_packages::tests::staged_
+
+Exit code:
+  127
+
+Actual output:
+  /bin/bash: line 1: cargo: command not found
+
+Focused public-API test command:
+  cargo test -p openmls --test stock_staged_key_package_api --no-default-features
+
+Exit code:
+  127
+
+Actual output:
+  /bin/bash: line 1: cargo: command not found
+
+Toolchain availability check:
+  command -v cargo
+  command -v rustc
+  command -v rustup
+  command -v rustfmt
+
+Observed result:
+  None of these commands is present on PATH in the Task 2 execution
+  environment. Therefore no compiler/test assertion output is claimed here.
+  The two focused commands above were genuinely attempted and their exact
+  command-not-found failures are recorded as required by the Task 2 brief's
+  toolchain-unavailable fallback.
+
+Expected RED boundary once the Rust toolchain is available:
+  The focused tests reference the frozen staged API (`prepare`,
+  `PreparedKeyPackage`, `BoundKeyPackage`, `KeyPackageStagingError`, and
+  `KeyPackage::canonical_binding_bytes`) that stock OpenMLS 0.9.0 does not
+  implement. Task 1 previously captured the compiler's E0599 failure for the
+  missing `KeyPackageBuilder::prepare` method; this file does not copy that old
+  output or present it as a Task 2 run.
+
+Reviewer-blocker follow-up (2026-09-14T09:49:15Z):
+  Added independent canonical-byte mutation assertions for the frozen
+  capabilities versions, ciphersuites, proposals, and credentials vectors.
+  Added serde-forged leaf-node cases for NonCanonicalExtensionType,
+  DuplicateExtensionType, and InvalidExtensionForLocation with exact LeafNode
+  locations. The Rust toolchain remains unavailable, so no new compiler or
+  test output is fabricated or appended.
