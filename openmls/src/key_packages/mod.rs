@@ -275,7 +275,6 @@ pub(crate) struct KeyPackageCreationResult {
     pub init_private_key: HpkePrivateKey,
 }
 
-
 /// A prepared KeyPackage whose public TBS material and leaf signature are frozen.
 ///
 /// This type is intentionally opaque and can only advance through
@@ -809,7 +808,6 @@ impl KeyPackage {
     }
 }
 
-
 impl KeyPackage {
     /// Return the canonical TLS serialization of this KeyPackageTBS with the
     /// designated external binding extension removed.
@@ -1032,8 +1030,7 @@ impl KeyPackageBuilder {
         Ok(())
     }
 
-
-    /// Prepare and freeze a KeyPackage before an external binding is computed.
+    //// Prepare and freeze a KeyPackage before an external binding is computed.
     pub fn prepare(
         mut self,
         ciphersuite: Ciphersuite,
