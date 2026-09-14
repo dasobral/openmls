@@ -16,7 +16,7 @@ use crate::{
     binary_tree::array_representation::LeafNodeIndex,
     ciphersuite::{
         signable::{Signable, SignedStruct, Verifiable, VerifiedStruct},
-        Signature, SignaturePublicKey,
+        OpenMlsSignaturePublicKey, Signature, SignaturePublicKey,
     },
     credentials::{Credential, CredentialType, CredentialWithKey},
     error::LibraryError,
@@ -302,6 +302,26 @@ impl LeafNode {
             .map_err(|_| LibraryError::custom("Signing failed"))
     }
 
+    /// Verify the signed LeafNodeTBS under the credential's public key.
+    pub(crate) fn verify_signature(
+        &self,
+        crypto: &impl OpenMlsCrypto,
+        ciphersuite: Ciphersuite,
+    ) -> Result<(), crate::ciphersuite::signable::SignatureError> {
+        let verifiable = LeafNodeIn::from(self.clone()).into_verifiable_leaf_node();
+        match verifiable {
+            VerifiableLeafNode::KeyPackage(leaf) => {
+                let signature_key = OpenMlsSignaturePublicKey::from_signature_key(
+                    self.signature_key().clone(),
+                    ciphersuite.signature_algorithm(),
+                );
+                leaf.verify_no_out(crypto, &signature_key)
+            }
+            VerifiableLeafNode::Update(_) | VerifiableLeafNode::Commit(_) => {
+                Err(crate::ciphersuite::signable::SignatureError::VerificationError)
+            }
+        }
+    }
     /// New [`LeafNode`] with a parent hash.
     ///
     /// With the `virtual-clients-draft` feature, an
