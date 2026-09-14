@@ -90,7 +90,8 @@
 
 use std::collections::HashSet;
 
-use crate::{    ciphersuite::{
+use crate::{
+    ciphersuite::{
         hash_ref::{make_key_package_ref, KeyPackageRef},
         signable::*,
         *,
@@ -733,6 +734,7 @@ impl KeyPackage {
 }
 
 
+impl KeyPackage {
     /// Return the canonical TLS serialization of this KeyPackageTBS with the
     /// designated external binding extension removed.
     pub fn canonical_binding_bytes(
@@ -786,6 +788,7 @@ impl KeyPackage {
             .tls_serialize_detached()
             .map_err(|_| KeyPackageStagingError::TlsSerializationError)
     }
+}
 
 /// Crate visible `KeyPackage` functions.
 impl KeyPackage {
