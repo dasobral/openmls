@@ -41,7 +41,7 @@ fn main() {
         .expect("serialize finalized KeyPackage");
     let validated = KeyPackageIn::tls_deserialize_exact(&wire)
         .expect("parse finalized KeyPackage")
-        .validate(&provider.crypto(), ProtocolVersion::Mls10)
+        .validate(provider.crypto(), ProtocolVersion::Mls10)
         .expect("validate finalized KeyPackage");
     let recomputed = validated
         .canonical_binding_bytes(BINDING_EXTENSION_TYPE)
