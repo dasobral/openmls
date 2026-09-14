@@ -88,15 +88,18 @@
 //!
 //! See [`KeyPackage`] for more details on how to use key packages.
 
-use crate::{
-    ciphersuite::{
+use std::collections::HashSet;
+
+use crate::{    ciphersuite::{
         hash_ref::{make_key_package_ref, KeyPackageRef},
         signable::*,
         *,
     },
     credentials::*,
     error::LibraryError,
-    extensions::{Extension, ExtensionType, Extensions, LastResortExtension},
+    extensions::{
+        Extension, ExtensionType, Extensions, LastResortExtension, UnknownExtension,
+    },
     storage::OpenMlsProvider,
     treesync::{
         node::{
@@ -235,6 +238,238 @@ pub(crate) struct KeyPackageCreationResult {
     pub key_package: KeyPackage,
     pub encryption_keypair: EncryptionKeyPair,
     pub init_private_key: HpkePrivateKey,
+}
+
+
+/// A prepared KeyPackage whose public TBS material and leaf signature are frozen.
+///
+/// This type is intentionally opaque and can only advance through
+/// with_external_binding.
+pub struct PreparedKeyPackage {
+    binding_extension_type: u16,
+    key_package_tbs: KeyPackageTbs,
+    canonical_binding_bytes: Vec<u8>,
+    init_private_key: HpkePrivateKey,
+    private_encryption_key: EncryptionPrivateKey,
+}
+
+/// A prepared KeyPackage after insertion of its external binding.
+///
+/// This type is intentionally opaque and can only advance through finalize.
+pub struct BoundKeyPackage {
+    key_package_tbs: KeyPackageTbs,
+    init_private_key: HpkePrivateKey,
+    private_encryption_key: EncryptionPrivateKey,
+}
+
+impl PreparedKeyPackage {
+    /// Return the canonical TLS serialization of the stripped KeyPackageTBS.
+    pub fn canonical_binding_bytes(&self) -> &[u8] {
+        &self.canonical_binding_bytes
+    }
+
+    /// Insert the non-empty external binding and consume this prepared state.
+    pub fn with_external_binding(
+        self,
+        binding_bytes: Vec<u8>,
+    ) -> Result<BoundKeyPackage, KeyPackageStagingError> {
+        if binding_bytes.is_empty() {
+            return Err(KeyPackageStagingError::EmptyBinding);
+        }
+
+        let PreparedKeyPackage {
+            binding_extension_type,
+            mut key_package_tbs,
+            init_private_key,
+            private_encryption_key,
+            ..
+        } = self;
+
+        key_package_tbs
+            .extensions
+            .add(Extension::Unknown(
+                binding_extension_type,
+                UnknownExtension(binding_bytes),
+            ))
+            .map_err(|_| KeyPackageStagingError::TlsSerializationError)?;
+
+        Ok(BoundKeyPackage {
+            key_package_tbs,
+            init_private_key,
+            private_encryption_key,
+        })
+    }
+}
+
+impl BoundKeyPackage {
+    /// Sign, validate, store, and return the final KeyPackageBundle.
+    pub fn finalize(
+        self,
+        provider: &impl OpenMlsProvider,
+        signer: &impl Signer,
+    ) -> Result<KeyPackageBundle, KeyPackageStagingError> {
+        let ciphersuite = self.key_package_tbs.ciphersuite;
+        if ciphersuite.signature_algorithm() != signer.signature_scheme() {
+            return Err(KeyPackageStagingError::KeyPackageNewError(
+                KeyPackageNewError::CiphersuiteSignatureSchemeMismatch,
+            ));
+        }
+
+        let key_package = self
+            .key_package_tbs
+            .sign(signer)
+            .map_err(|error| {
+                KeyPackageStagingError::KeyPackageNewError(
+                    KeyPackageNewError::SignatureError(error),
+                )
+            })?;
+
+        let wire = key_package
+            .tls_serialize_detached()
+            .map_err(|_| KeyPackageStagingError::TlsSerializationError)?;
+        let parsed = KeyPackageIn::tls_deserialize_exact(&wire)
+            .map_err(|_| KeyPackageStagingError::TlsSerializationError)?;
+
+        match parsed.validate(provider.crypto(), ProtocolVersion::Mls10) {
+            Ok(_) => {}
+            Err(KeyPackageVerifyError::InvalidLeafNodeSignature)
+            | Err(KeyPackageVerifyError::InvalidSignature) => {
+                return Err(KeyPackageStagingError::SignerMismatch);
+            }
+            Err(_) => {
+                return Err(KeyPackageStagingError::KeyPackageNewError(
+                    KeyPackageNewError::LibraryError(LibraryError::custom(
+                        "final staged KeyPackage validation failed",
+                    )),
+                ));
+            }
+        }
+
+        let full_kp = KeyPackageBundle {
+            key_package,
+            private_init_key: self.init_private_key,
+            private_encryption_key: self.private_encryption_key,
+        };
+        let key_package_ref = full_kp
+            .key_package
+            .hash_ref(provider.crypto())
+            .map_err(|error| {
+                KeyPackageStagingError::KeyPackageNewError(
+                    KeyPackageNewError::LibraryError(error),
+                )
+            })?;
+
+        provider
+            .storage()
+            .write_key_package(&key_package_ref, &full_kp)
+            .map_err(|_| {
+                KeyPackageStagingError::KeyPackageNewError(KeyPackageNewError::StorageError)
+            })?;
+
+        Ok(full_kp)
+    }
+}
+
+fn validate_binding_extension_type(
+    binding_extension_type: u16,
+) -> Result<(), KeyPackageStagingError> {
+    if ExtensionType::from(binding_extension_type)
+        != ExtensionType::Unknown(binding_extension_type)
+    {
+        return Err(KeyPackageStagingError::InvalidBindingExtensionType(
+            binding_extension_type,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_staged_extensions(
+    key_package_extensions: &Extensions<KeyPackage>,
+    leaf_node_extensions: &Extensions<LeafNode>,
+    capabilities: &Capabilities,
+    binding_extension_type: u16,
+) -> Result<(), KeyPackageStagingError> {
+    if key_package_extensions
+        .iter()
+        .any(|extension| u16::from(extension.extension_type()) == binding_extension_type)
+    {
+        return Err(KeyPackageStagingError::DuplicateBindingExtension(
+            binding_extension_type,
+        ));
+    }
+
+    let mut seen = HashSet::new();
+    for extension in key_package_extensions.iter() {
+        let extension_type = extension.extension_type();
+        let encoded_type = u16::from(extension_type);
+        if ExtensionType::from(encoded_type) != extension_type {
+            return Err(KeyPackageStagingError::NonCanonicalExtensionType {
+                location: StagedExtensionLocation::KeyPackage,
+                extension_type: encoded_type,
+            });
+        }
+        if !seen.insert(encoded_type) {
+            return Err(KeyPackageStagingError::DuplicateExtensionType {
+                location: StagedExtensionLocation::KeyPackage,
+                extension_type: encoded_type,
+            });
+        }
+        if !extension_type.is_valid_in_key_package() {
+            return Err(KeyPackageStagingError::InvalidExtensionForLocation {
+                location: StagedExtensionLocation::KeyPackage,
+                extension_type: encoded_type,
+            });
+        }
+        if !extension_type.is_default()
+            && !capabilities.extensions().contains(&extension_type)
+        {
+            return Err(KeyPackageStagingError::ExtensionNotAdvertised {
+                location: StagedExtensionLocation::KeyPackage,
+                extension_type: encoded_type,
+            });
+        }
+    }
+
+    let mut seen = HashSet::new();
+    for extension in leaf_node_extensions.iter() {
+        let extension_type = extension.extension_type();
+        let encoded_type = u16::from(extension_type);
+        if ExtensionType::from(encoded_type) != extension_type {
+            return Err(KeyPackageStagingError::NonCanonicalExtensionType {
+                location: StagedExtensionLocation::LeafNode,
+                extension_type: encoded_type,
+            });
+        }
+        if !seen.insert(encoded_type) {
+            return Err(KeyPackageStagingError::DuplicateExtensionType {
+                location: StagedExtensionLocation::LeafNode,
+                extension_type: encoded_type,
+            });
+        }
+        if !extension_type.is_valid_in_leaf_node() {
+            return Err(KeyPackageStagingError::InvalidExtensionForLocation {
+                location: StagedExtensionLocation::LeafNode,
+                extension_type: encoded_type,
+            });
+        }
+        if !capabilities.extensions().contains(&extension_type) {
+            return Err(KeyPackageStagingError::ExtensionNotAdvertised {
+                location: StagedExtensionLocation::LeafNode,
+                extension_type: encoded_type,
+            });
+        }
+    }
+
+    if !capabilities
+        .extensions()
+        .contains(&ExtensionType::Unknown(binding_extension_type))
+    {
+        return Err(KeyPackageStagingError::BindingExtensionNotAdvertised(
+            binding_extension_type,
+        ));
+    }
+
+    Ok(())
 }
 
 /// Init key for HPKE.
@@ -497,6 +732,61 @@ impl KeyPackage {
     }
 }
 
+
+    /// Return the canonical TLS serialization of this KeyPackageTBS with the
+    /// designated external binding extension removed.
+    pub fn canonical_binding_bytes(
+        &self,
+        binding_extension_type: u16,
+    ) -> Result<Vec<u8>, KeyPackageStagingError> {
+        validate_binding_extension_type(binding_extension_type)?;
+
+        let matching_count = self
+            .payload
+            .extensions
+            .iter()
+            .filter(|extension| {
+                u16::from(extension.extension_type()) == binding_extension_type
+            })
+            .count();
+        if matching_count == 0 {
+            return Err(KeyPackageStagingError::MissingBindingExtension(
+                binding_extension_type,
+            ));
+        }
+        if matching_count > 1 {
+            return Err(KeyPackageStagingError::DuplicateBindingExtension(
+                binding_extension_type,
+            ));
+        }
+
+        let binding_is_empty = self
+            .payload
+            .extensions
+            .iter()
+            .find(|extension| {
+                u16::from(extension.extension_type()) == binding_extension_type
+            })
+            .map(|extension| {
+                matches!(
+                    extension,
+                    Extension::Unknown(_, UnknownExtension(binding)) if binding.is_empty()
+                )
+            })
+            .unwrap_or(false);
+        if binding_is_empty {
+            return Err(KeyPackageStagingError::EmptyBinding);
+        }
+
+        let mut key_package_tbs = self.payload.clone();
+        key_package_tbs
+            .extensions
+            .remove(ExtensionType::Unknown(binding_extension_type));
+        key_package_tbs
+            .tls_serialize_detached()
+            .map_err(|_| KeyPackageStagingError::TlsSerializationError)
+    }
+
 /// Crate visible `KeyPackage` functions.
 impl KeyPackage {
     /// Get the `ProtocolVersion`.
@@ -575,6 +865,93 @@ impl KeyPackageBuilder {
                 );
             }
         }
+    }
+
+
+    /// Prepare and freeze a KeyPackage before an external binding is computed.
+    pub fn prepare(
+        mut self,
+        ciphersuite: Ciphersuite,
+        provider: &impl OpenMlsProvider,
+        signer: &impl Signer,
+        credential_with_key: CredentialWithKey,
+        binding_extension_type: u16,
+    ) -> Result<PreparedKeyPackage, KeyPackageStagingError> {
+        validate_binding_extension_type(binding_extension_type)?;
+        self.ensure_last_resort();
+
+        let key_package_extensions = self.key_package_extensions.unwrap_or_default();
+        let leaf_node_extensions = self.leaf_node_extensions.unwrap_or_default();
+        let capabilities = self.leaf_node_capabilities.unwrap_or_default();
+
+        validate_staged_extensions(
+            &key_package_extensions,
+            &leaf_node_extensions,
+            &capabilities,
+            binding_extension_type,
+        )?;
+
+        if ciphersuite.signature_algorithm() != signer.signature_scheme() {
+            return Err(KeyPackageStagingError::KeyPackageNewError(
+                KeyPackageNewError::CiphersuiteSignatureSchemeMismatch,
+            ));
+        }
+        provider
+            .crypto()
+            .supports(ciphersuite)
+            .map_err(|_| {
+                KeyPackageStagingError::KeyPackageNewError(
+                    KeyPackageNewError::UnsupportedCiphersuite(ciphersuite),
+                )
+            })?;
+
+        let ikm = Secret::random(ciphersuite, provider.rand())
+            .map_err(LibraryError::unexpected_crypto_error)
+            .map_err(KeyPackageNewError::LibraryError)?;
+        let init_key = provider
+            .crypto()
+            .derive_hpke_keypair(ciphersuite.hpke_config(), ikm.as_slice())
+            .map_err(LibraryError::unexpected_crypto_error)
+            .map_err(KeyPackageNewError::LibraryError)?;
+
+        let (leaf_node, encryption_keypair) = LeafNode::new(
+            provider,
+            signer,
+            NewLeafNodeParams {
+                ciphersuite,
+                credential_with_key,
+                leaf_node_source: LeafNodeSource::KeyPackage(
+                    self.key_package_lifetime.unwrap_or_default(),
+                ),
+                capabilities,
+                extensions: leaf_node_extensions,
+                tree_info_tbs: TreeInfoTbs::KeyPackage,
+            },
+        )
+        .map_err(KeyPackageNewError::LibraryError)?;
+
+        leaf_node
+            .verify_signature(provider.crypto(), ciphersuite)
+            .map_err(|_| KeyPackageStagingError::SignerMismatch)?;
+
+        let key_package_tbs = KeyPackageTbs {
+            protocol_version: ProtocolVersion::default(),
+            ciphersuite,
+            init_key: init_key.public.into(),
+            leaf_node,
+            extensions: key_package_extensions,
+        };
+        let canonical_binding_bytes = key_package_tbs
+            .tls_serialize_detached()
+            .map_err(|_| KeyPackageStagingError::TlsSerializationError)?;
+
+        Ok(PreparedKeyPackage {
+            binding_extension_type,
+            key_package_tbs,
+            canonical_binding_bytes,
+            init_private_key: init_key.private,
+            private_encryption_key: encryption_keypair.private_key().clone(),
+        })
     }
 
     #[cfg(test)]
