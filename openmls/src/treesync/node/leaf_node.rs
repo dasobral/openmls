@@ -502,6 +502,7 @@ impl LeafNode {
             }
         }
     }
+
     /// New [`LeafNode`] with a parent hash.
     ///
     /// With the `virtual-clients-draft` feature, an
