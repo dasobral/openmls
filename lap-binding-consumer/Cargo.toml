@@ -1,0 +1,12 @@
+[package]
+name = "lap-binding-consumer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+openmls = { path = "../openmls" }
+openmls_basic_credential = { path = "../basic_credential" }
+openmls_rust_crypto = { path = "../openmls_rust_crypto" }
