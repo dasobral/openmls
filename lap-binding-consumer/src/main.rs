@@ -1,4 +1,5 @@
 use openmls::prelude::*;
+use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 

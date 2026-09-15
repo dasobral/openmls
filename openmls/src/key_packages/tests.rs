@@ -3,16 +3,14 @@ use crate::{
     treesync::node::leaf_node::Capabilities,
 };
 use openmls_basic_credential::SignatureKeyPair;
-use openmls_traits::types::{Ciphersuite, SignatureScheme};
+use openmls_traits::{
+    types::{Ciphersuite, SignatureScheme},
+    OpenMlsProvider as _,
+};
 
 use tls_codec::{Deserialize, Serialize};
 
-use crate::{
-    extensions::errors::*,
-    extensions::*,
-    key_packages::{errors::*, *},
-    storage::OpenMlsProvider,
-};
+use crate::{extensions::errors::*, extensions::*, key_packages::*, storage::OpenMlsProvider};
 
 const STAGED_BINDING_EXTENSION_TYPE: u16 = 0xf042;
 const STAGED_TOP_LEVEL_EXTENSION_TYPE: u16 = 0xf043;
@@ -799,7 +797,10 @@ fn staged_prepare_freezes_complete_canonical_tbs() {
     let mut caller_copy = canonical_bytes.clone();
     caller_copy[0] ^= 1;
     assert_ne!(caller_copy.as_slice(), prepared.canonical_binding_bytes());
-    assert_eq!(prepared.canonical_binding_bytes(), canonical_bytes.as_slice());
+    assert_eq!(
+        prepared.canonical_binding_bytes(),
+        canonical_bytes.as_slice()
+    );
 
     let tbs = frankenstein::FrankenKeyPackageTbs::tls_deserialize_exact(&canonical_bytes)
         .expect("canonical bytes are exactly one KeyPackageTBS");
@@ -807,7 +808,11 @@ fn staged_prepare_freezes_complete_canonical_tbs() {
     assert_eq!(tbs.ciphersuite, u16::from(ciphersuite));
     assert_eq!(
         tbs.leaf_node.capabilities.extensions,
-        advertised.iter().copied().map(u16::from).collect::<Vec<_>>()
+        advertised
+            .iter()
+            .copied()
+            .map(u16::from)
+            .collect::<Vec<_>>()
     );
     assert!(matches!(
         tbs.leaf_node.leaf_node_source,
@@ -1078,12 +1083,18 @@ fn staged_finalization_is_single_use_and_stores_once() {
             STAGED_BINDING_EXTENSION_TYPE,
         )
         .expect("prepare staged KeyPackage");
-    assert_eq!(provider.storage().values.read().unwrap().len(), initial_entries);
+    assert_eq!(
+        provider.storage().values.read().unwrap().len(),
+        initial_entries
+    );
 
     let bound = prepared
         .with_external_binding(vec![0x01])
         .expect("bind staged KeyPackage");
-    assert_eq!(provider.storage().values.read().unwrap().len(), initial_entries);
+    assert_eq!(
+        provider.storage().values.read().unwrap().len(),
+        initial_entries
+    );
 
     // `BoundKeyPackage::finalize` consumes `bound`; a second finalization of
     // this state is unrepresentable. The public integration test additionally
@@ -1488,10 +1499,8 @@ fn staged_binding_and_extension_malformations_are_rejected() {
     ));
 
     let invalid_leaf_value = serde_json::to_value(
-        Extensions::<KeyPackage>::single(Extension::LastResort(
-            LastResortExtension::default(),
-        ))
-        .unwrap(),
+        Extensions::<KeyPackage>::single(Extension::LastResort(LastResortExtension::default()))
+            .unwrap(),
     )
     .unwrap();
     let invalid_leaf: Extensions<LeafNode> = serde_json::from_value(invalid_leaf_value).unwrap();
@@ -1534,9 +1543,7 @@ fn staged_binding_and_extension_malformations_are_rejected() {
     let binding = duplicate_wire
         .extensions
         .iter()
-        .find(|extension| {
-            u16::from(extension.extension_type()) == STAGED_BINDING_EXTENSION_TYPE
-        })
+        .find(|extension| u16::from(extension.extension_type()) == STAGED_BINDING_EXTENSION_TYPE)
         .unwrap()
         .clone();
     duplicate_wire.extensions.push(binding);
