@@ -5,6 +5,7 @@
 //! implemented. As an external crate, it cannot access private TBS or signing
 //! internals, and it does not reconstruct look-alike serialization.
 
+use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_test::openmls_test;
@@ -81,7 +82,7 @@ fn stock_api_cannot_stage_key_package_external_binding() {
     let external_binding = canonical_bytes.clone();
     let bound: BoundKeyPackage =
         PreparedKeyPackage::with_external_binding(prepared, external_binding)
-        .expect("insert the externally produced binding");
+            .expect("insert the externally produced binding");
     let bundle = BoundKeyPackage::finalize(bound, provider, &signer)
         .expect("sign and store the bound KeyPackage");
 
@@ -93,11 +94,9 @@ fn stock_api_cannot_stage_key_package_external_binding() {
         .expect("TLS-parse the finalized KeyPackage")
         .validate(provider.crypto(), ProtocolVersion::Mls10)
         .expect("validate both MLS signatures on the finalized KeyPackage");
-    let recomputed_canonical_bytes = KeyPackage::canonical_binding_bytes(
-        &validated_key_package,
-        BINDING_EXTENSION_TYPE,
-    )
-    .expect("recompute canonical binding bytes from the validated KeyPackage");
+    let recomputed_canonical_bytes =
+        KeyPackage::canonical_binding_bytes(&validated_key_package, BINDING_EXTENSION_TYPE)
+            .expect("recompute canonical binding bytes from the validated KeyPackage");
 
     assert_eq!(recomputed_canonical_bytes, canonical_bytes);
 }

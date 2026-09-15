@@ -114,7 +114,8 @@ use openmls_traits::{
 };
 use serde::{Deserialize, Serialize};
 use tls_codec::{
-    Serialize as TlsSerializeTrait, TlsDeserialize, TlsDeserializeBytes, TlsSerialize, TlsSize,
+    Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait, TlsDeserialize,
+    TlsDeserializeBytes, TlsSerialize, TlsSize,
 };
 
 // Private
@@ -312,23 +313,15 @@ impl BoundKeyPackage {
                 KeyPackageNewError::CiphersuiteSignatureSchemeMismatch,
             ));
         }
-        provider
-            .crypto()
-            .supports(ciphersuite)
-            .map_err(|_| {
-                KeyPackageStagingError::KeyPackageNewError(
-                    KeyPackageNewError::UnsupportedCiphersuite(ciphersuite),
-                )
-            })?;
+        provider.crypto().supports(ciphersuite).map_err(|_| {
+            KeyPackageStagingError::KeyPackageNewError(KeyPackageNewError::UnsupportedCiphersuite(
+                ciphersuite,
+            ))
+        })?;
 
-        let key_package = self
-            .key_package_tbs
-            .sign(signer)
-            .map_err(|error| {
-                KeyPackageStagingError::KeyPackageNewError(
-                    KeyPackageNewError::SignatureError(error),
-                )
-            })?;
+        let key_package = self.key_package_tbs.sign(signer).map_err(|error| {
+            KeyPackageStagingError::KeyPackageNewError(KeyPackageNewError::SignatureError(error))
+        })?;
 
         let wire = key_package
             .tls_serialize_detached()
@@ -360,9 +353,7 @@ impl BoundKeyPackage {
             .key_package
             .hash_ref(provider.crypto())
             .map_err(|error| {
-                KeyPackageStagingError::KeyPackageNewError(
-                    KeyPackageNewError::LibraryError(error),
-                )
+                KeyPackageStagingError::KeyPackageNewError(KeyPackageNewError::LibraryError(error))
             })?;
 
         provider
@@ -379,8 +370,7 @@ impl BoundKeyPackage {
 fn validate_binding_extension_type(
     binding_extension_type: u16,
 ) -> Result<(), KeyPackageStagingError> {
-    if ExtensionType::from(binding_extension_type)
-        != ExtensionType::Unknown(binding_extension_type)
+    if ExtensionType::from(binding_extension_type) != ExtensionType::Unknown(binding_extension_type)
     {
         return Err(KeyPackageStagingError::InvalidBindingExtensionType(
             binding_extension_type,
@@ -426,9 +416,7 @@ fn validate_staged_extensions(
                 extension_type: encoded_type,
             });
         }
-        if !extension_type.is_default()
-            && !capabilities.extensions().contains(&extension_type)
-        {
+        if !extension_type.is_default() && !capabilities.extensions().contains(&extension_type) {
             return Err(KeyPackageStagingError::ExtensionNotAdvertised {
                 location: StagedExtensionLocation::KeyPackage,
                 extension_type: encoded_type,
@@ -751,9 +739,7 @@ impl KeyPackage {
             .payload
             .extensions
             .iter()
-            .filter(|extension| {
-                u16::from(extension.extension_type()) == binding_extension_type
-            })
+            .filter(|extension| u16::from(extension.extension_type()) == binding_extension_type)
             .count();
         if matching_count == 0 {
             return Err(KeyPackageStagingError::MissingBindingExtension(
@@ -770,9 +756,7 @@ impl KeyPackage {
             .payload
             .extensions
             .iter()
-            .find(|extension| {
-                u16::from(extension.extension_type()) == binding_extension_type
-            })
+            .find(|extension| u16::from(extension.extension_type()) == binding_extension_type)
             .map(|extension| {
                 matches!(
                     extension,
@@ -874,7 +858,12 @@ impl KeyPackageBuilder {
         }
     }
 
-    //// Prepare and freeze a KeyPackage before an external binding is computed.
+    /// Prepare and freeze a KeyPackage before an external binding is computed.
+    ///
+    /// The returned state retains the generated private key material and exposes
+    /// the canonical stripped `KeyPackageTBS` bytes used to compute the binding.
+    /// The designated extension type must be unknown, absent from the builder's
+    /// KeyPackage extensions, and advertised by the leaf capabilities.
     pub fn prepare(
         mut self,
         ciphersuite: Ciphersuite,
@@ -902,14 +891,11 @@ impl KeyPackageBuilder {
                 KeyPackageNewError::CiphersuiteSignatureSchemeMismatch,
             ));
         }
-        provider
-            .crypto()
-            .supports(ciphersuite)
-            .map_err(|_| {
-                KeyPackageStagingError::KeyPackageNewError(
-                    KeyPackageNewError::UnsupportedCiphersuite(ciphersuite),
-                )
-            })?;
+        provider.crypto().supports(ciphersuite).map_err(|_| {
+            KeyPackageStagingError::KeyPackageNewError(KeyPackageNewError::UnsupportedCiphersuite(
+                ciphersuite,
+            ))
+        })?;
 
         let ikm = Secret::random(ciphersuite, provider.rand())
             .map_err(LibraryError::unexpected_crypto_error)
