@@ -1029,11 +1029,25 @@ impl KeyPackageBuilder {
         binding_extension_type: u16,
     ) -> Result<PreparedKeyPackage, KeyPackageStagingError> {
         validate_binding_extension_type(binding_extension_type)?;
-        self.ensure_last_resort();
+        // Report a missing last-resort capability like any other unadvertised
+        // KeyPackage extension.
+        self.ensure_last_resort().map_err(|error| match error {
+            KeyPackageNewError::MissingLastResortCapability(extension_type) => {
+                KeyPackageStagingError::ExtensionNotAdvertised {
+                    location: StagedExtensionLocation::KeyPackage,
+                    extension_type: u16::from(extension_type),
+                }
+            }
+            error => error.into(),
+        })?;
 
         let key_package_extensions = self.key_package_extensions.unwrap_or_default();
         let leaf_node_extensions = self.leaf_node_extensions.unwrap_or_default();
+        // Staged construction never widens: every extension it retains, and the
+        // binding type, must be advertised by the capabilities the caller set,
+        // so the frozen TBS contains exactly those capabilities.
         let capabilities = self.leaf_node_capabilities.unwrap_or_default();
+        let capabilities_policy = CapabilitiesPolicy::Reject;
 
         validate_staged_extensions(
             &key_package_extensions,
@@ -1074,9 +1088,13 @@ impl KeyPackageBuilder {
                 capabilities,
                 extensions: leaf_node_extensions,
                 tree_info_tbs: TreeInfoTbs::KeyPackage,
+                // A bare KeyPackage has no group context to source required
+                // capabilities from.
+                constraints: LeafNodeConstraints::default(),
+                capabilities_policy,
             },
         )
-        .map_err(KeyPackageNewError::LibraryError)?;
+        .map_err(KeyPackageNewError::LeafNodeBuild)?;
 
         leaf_node
             .verify_signature(provider.crypto(), ciphersuite)

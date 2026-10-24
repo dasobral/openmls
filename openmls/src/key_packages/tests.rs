@@ -24,7 +24,13 @@ fn credential_with_key(identity: &[u8], signer: &SignatureKeyPair) -> Credential
 }
 
 fn staged_capabilities(ciphersuite: Ciphersuite, extensions: &[ExtensionType]) -> Capabilities {
-    Capabilities::new(None, Some(&[ciphersuite]), Some(extensions), None, None)
+    Capabilities::new(
+        None,
+        Some(&[ciphersuite]),
+        Some(extensions),
+        None,
+        Some(&[CredentialType::Basic]),
+    )
 }
 
 fn staging_error<T>(result: Result<T, KeyPackageStagingError>) -> KeyPackageStagingError {
@@ -360,6 +366,20 @@ fn last_resort_extension_type() -> ExtensionType {
 #[cfg(not(feature = "extensions-draft"))]
 fn last_resort_extension_type() -> ExtensionType {
     ExtensionType::LastResort
+}
+
+/// The extension that marks a KeyPackage as last resort in this build.
+#[cfg(feature = "extensions-draft")]
+fn last_resort_marker() -> Extension {
+    let mut dictionary = AppDataDictionary::new();
+    dictionary.insert(last_resort_component_id(), Vec::new());
+    Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary))
+}
+
+/// The extension that marks a KeyPackage as last resort in this build.
+#[cfg(not(feature = "extensions-draft"))]
+fn last_resort_marker() -> Extension {
+    Extension::LastResort(LastResortExtension::default())
 }
 
 fn last_resort_capabilities(ciphersuite: Ciphersuite) -> Capabilities {
@@ -754,7 +774,7 @@ fn staged_prepare_freezes_complete_canonical_tbs() {
         ExtensionType::Unknown(STAGED_BINDING_EXTENSION_TYPE),
         ExtensionType::Unknown(STAGED_TOP_LEVEL_EXTENSION_TYPE),
         ExtensionType::Unknown(STAGED_LEAF_EXTENSION_TYPE),
-        ExtensionType::LastResort,
+        last_resort_extension_type(),
     ];
     let lifetime = Lifetime::default();
     let prepared = KeyPackage::builder()
@@ -826,7 +846,7 @@ fn staged_prepare_freezes_complete_canonical_tbs() {
             .collect::<Vec<_>>(),
         vec![
             frankenstein::FrankenExtensionType::Unknown(STAGED_TOP_LEVEL_EXTENSION_TYPE),
-            frankenstein::FrankenExtensionType::LastResort,
+            frankenstein::FrankenExtensionType::from(u16::from(last_resort_extension_type())),
         ]
     );
     assert!(!tbs.extensions.iter().any(|extension| {
@@ -939,7 +959,7 @@ fn staged_binding_insertion_signatures_and_verifier_recomputation() {
         ExtensionType::Unknown(STAGED_BINDING_EXTENSION_TYPE),
         ExtensionType::Unknown(STAGED_TOP_LEVEL_EXTENSION_TYPE),
         ExtensionType::Unknown(STAGED_LEAF_EXTENSION_TYPE),
-        ExtensionType::LastResort,
+        last_resort_extension_type(),
     ];
     let prepared = KeyPackage::builder()
         .key_package_extensions(
@@ -983,7 +1003,7 @@ fn staged_binding_insertion_signatures_and_verifier_recomputation() {
                 STAGED_TOP_LEVEL_EXTENSION_TYPE,
                 UnknownExtension(vec![0xa1])
             ),
-            Extension::LastResort(LastResortExtension::default()),
+            last_resort_marker(),
             Extension::Unknown(
                 STAGED_BINDING_EXTENSION_TYPE,
                 UnknownExtension(binding.clone())
@@ -1548,7 +1568,7 @@ fn staged_binding_and_extension_malformations_are_rejected() {
         .clone();
     duplicate_wire.extensions.push(binding);
     assert!(
-        KeyPackageIn::tls_deserialize_exact(&duplicate_wire.tls_serialize_detached().unwrap())
+        KeyPackageIn::tls_deserialize_exact(duplicate_wire.tls_serialize_detached().unwrap())
             .is_err(),
         "normal TLS decoding must reject duplicate numeric binding extensions"
     );
@@ -1632,15 +1652,15 @@ fn staged_retained_extensions_require_explicit_advertisement() {
         error,
         KeyPackageStagingError::ExtensionNotAdvertised {
             location: StagedExtensionLocation::KeyPackage,
-            extension_type: 10,
-        }
+            extension_type,
+        } if extension_type == u16::from(last_resort_extension_type())
     ));
 
     let all_advertised = [
         ExtensionType::Unknown(STAGED_BINDING_EXTENSION_TYPE),
         ExtensionType::Unknown(STAGED_TOP_LEVEL_EXTENSION_TYPE),
         ExtensionType::Unknown(STAGED_LEAF_EXTENSION_TYPE),
-        ExtensionType::LastResort,
+        last_resort_extension_type(),
     ];
     let bundle = KeyPackage::builder()
         .leaf_node_capabilities(staged_capabilities(ciphersuite, &all_advertised))
@@ -1724,15 +1744,21 @@ fn staged_api_preserves_ordinary_build_with_unadvertised_extensions_and_last_res
         .extensions()
         .contains(ExtensionType::Unknown(STAGED_LEAF_EXTENSION_TYPE)));
 
+    // With no capabilities set, the ordinary builder widens them to cover the
+    // KeyPackage's own extensions, so the result passes receive validation.
+    let capabilities = bundle.key_package().leaf_node().capabilities();
+    assert!(capabilities
+        .extensions()
+        .contains(&ExtensionType::Unknown(STAGED_TOP_LEVEL_EXTENSION_TYPE)));
+    assert!(capabilities
+        .extensions()
+        .contains(&ExtensionType::Unknown(STAGED_LEAF_EXTENSION_TYPE)));
+
     let wire = bundle.key_package().tls_serialize_detached().unwrap();
-    assert_eq!(
-        KeyPackageIn::tls_deserialize_exact(&wire)
-            .unwrap()
-            .validate(provider.crypto(), ProtocolVersion::Mls10)
-            .unwrap_err(),
-        KeyPackageVerifyError::UnsupportedExtension,
-        "normal receive validation, not ordinary build, owns this stock check"
-    );
+    KeyPackageIn::tls_deserialize_exact(&wire)
+        .unwrap()
+        .validate(provider.crypto(), ProtocolVersion::Mls10)
+        .expect("the widened KeyPackage passes normal receive validation");
 }
 
 /// Build a batch of virtual-client KeyPackages and verify the first carries a

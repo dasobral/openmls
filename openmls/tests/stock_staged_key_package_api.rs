@@ -65,6 +65,8 @@ fn stock_api_cannot_stage_key_package_external_binding() {
     };
     let capabilities = Capabilities::builder()
         .extensions(vec![ExtensionType::Unknown(BINDING_EXTENSION_TYPE)])
+        .ciphersuites(vec![ciphersuite])
+        .credentials(vec![CredentialType::Basic])
         .build();
 
     let prepared: PreparedKeyPackage = KeyPackage::builder()
